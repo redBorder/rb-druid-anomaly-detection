@@ -19,18 +19,31 @@ from pydantic import BaseModel
 
 import json
 
+def get_aggregations(druid_query):
+  aggregations={}
+  for aggregation in druid_query["aggregations"]:
+    aggregations.update({aggregation["name"]: {"type": aggregation["type"], "fieldName": aggregation["fieldName"]}})
+  return aggregations
+
+def get_filter(druid_query):
+  druid_filter = druid_query["filter"]
+  return Dimension(druid_filter["dimension"]) == druid_filter["value"]
+
 def process_rb(data_request, druid_query):
-  druid_url = "http://{}:{}".format(data_request.brokerHost, data_request.brokerPort)
+  druid_url = "http://{}:{}".format(data_request.broker_host, data_request.broker_port)
   print("druid_url {}".format(druid_url))
   query = PyDruid(druid_url, 'druid/v2')
   
+  print("Interval are: ")
+  print("%s/p1d" % (druid_query["granularity"]["origin"], ))
   # training
+  # TODO: Check query type, and what happen when there is more than one filter
   ts = query.timeseries(
       datasource=druid_query["dataSource"],
       granularity=data_request.granularity,
       intervals="%s/p1d" % (druid_query["granularity"]["origin"], ),
-      aggregations={'bytes': doublesum('sum_bytes')},
-      filter=Dimension('sensor_name') == 'ASR'
+      aggregations=get_aggregations(druid_query),
+      filter=get_filter(druid_query)
   )
   
   # get the data
@@ -72,10 +85,14 @@ def process_rb(data_request, druid_query):
   save_model(iforest, 'iforest_pipeline')
   return predictions
 
-# From the predictions that returns the model
-# build a json to reply to rb-manager with 
-# an json event per anomaly and its predicted value
 def process_anomalies(predictions):
+  """ Create anomalies json response with predicctions generated from the model.
+    Args:
+      predictions
+
+    Returns:
+      anomalies
+  """
   df = predictions
   df = df.reset_index()
   anomalies = []
@@ -95,23 +112,17 @@ def process_anomalies(predictions):
   return anomalies
 
 ####### REST API ##########
-class Data(BaseModel):
+class DataRequest(BaseModel):
   query: str
   granularity: str
-  granularityRange: str
-  timeseriesRange: int
+  granularity_range: str
+  timeseries_range: int
   frequency: str
-  queryEndTimeText: str
-  detectionWindow: int
-  hoursOfLag: str
-  clusterId: str
-  tsFramework: str
-  adModels: str
-  sigmaThreshold: int
-  tsModels: str
-  brokerHost: str
-  brokerPort: int
-
+  query_end_time_text: str
+  detection_window: int
+  hours_of_lag: str
+  broker_host: str
+  broker_port: int
 
 app = FastAPI()
 
@@ -120,10 +131,11 @@ async def root():
     return {"message": "Hello World"}
 
 @app.post("/process_query/")
-async def process_query(data_request: Data) -> Data:    
+async def process_query(data_request: DataRequest) -> DataRequest:    
     response = {}
-    try:
-      druid_query = json.loads(data_request.query)
+    
+    druid_query = json.loads(data_request.query)
+    try:    
       predictions = process_rb(data_request, druid_query)
       anomalies = process_anomalies(predictions)
     except:
