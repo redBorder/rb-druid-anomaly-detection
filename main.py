@@ -1,5 +1,3 @@
-#import urllib.request
-
 import pandas as pd
 
 from pylab import plt
@@ -14,75 +12,62 @@ import pycaret
 from pycaret.anomaly import *
 
 from typing import Union
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 
 import json
+from types import SimpleNamespace
 
-def get_aggregations(druid_query):
+import requests
+
+
+def build_aggregations(data_aggregations):
   aggregations={}
-  for aggregation in druid_query["aggregations"]:
+  for aggregation in data_aggregations:
     aggregations.update({aggregation["name"]: {"type": aggregation["type"], "fieldName": aggregation["fieldName"]}})
   return aggregations
 
-def get_filter(druid_query):
-  druid_filter = druid_query["filter"]
+def build_filter(filters):
+  druid_filter = filters
   return Dimension(druid_filter["dimension"]) == druid_filter["value"]
 
-def process_rb(data_request, druid_query):
-  druid_url = "http://{}:{}".format(data_request.broker_host, data_request.broker_port)
+def query_druid(broker_host, broker_port, data_sources, granularity, intervals, aggregations, filters):
+  """
+    Returns: 
+      data: panda table with result from druid
+  """
+  druid_url = "http://{}:{}".format(broker_host, broker_port)
   print("druid_url {}".format(druid_url))
   query = PyDruid(druid_url, 'druid/v2')
-  
-  print("Interval are: ")
-  print("%s/p1d" % (druid_query["granularity"]["origin"], ))
-  # training
+
   # TODO: Check query type, and what happen when there is more than one filter
   ts = query.timeseries(
-      datasource=druid_query["dataSource"],
-      granularity=data_request.granularity,
-      intervals="%s/p1d" % (druid_query["granularity"]["origin"], ),
-      aggregations=get_aggregations(druid_query),
-      filter=get_filter(druid_query)
+      datasource=data_sources,
+      granularity=granularity,
+      intervals=intervals,
+      aggregations=aggregations,
+      filter=filters
   )
-  
+
   # get the data
   data = query.export_pandas()
-  
-  print(data)
-  
-  # init setup
-  s=setup(data,normalize = True,silent=True)
-  
-  # train isolation forest model
-  iforest = create_model('iforest')
-  
+  return data
+
+def build_predictions(training_data, new_data):
+   # init setup
+  s=setup(training_data,normalize = True,silent=True)
+  # train model
+  model = create_model('iforest') 
   # assign anomaly labels on training data
-  iforest_results = assign_model(iforest)
+  model_results = assign_model(model)
+  print(model_results)
   
-  #iforest_results[iforest_results['Anomaly']==1].shape
-  #iforest_results[iforest_results['Anomaly']==0].shape
-  
-  print(iforest_results)
-  
-  # prediction
-  ts = query.timeseries(
-      datasource=druid_query["dataSource"],
-      granularity=data_request.granularity,
-      intervals=druid_query["intervals"],
-      aggregations={'bytes': doublesum('sum_bytes')},
-      filter=Dimension('sensor_name') == 'ASR'
-  )
-  new_data = query.export_pandas()
-  
-  print(new_data)
-  
-  predictions = predict_model(iforest, new_data)
-  
+  # prediction 
+  predictions = predict_model(model, new_data)
   print(predictions)
-  
-  # save iforest pipeline
-  save_model(iforest, 'iforest_pipeline')
+
+  # save model pipeline
+  save_model(model, 'model_pipeline')
   return predictions
 
 def process_anomalies(predictions):
@@ -97,57 +82,61 @@ def process_anomalies(predictions):
   df = df.reset_index()
   anomalies = []
 
-  for index,row in df.iterrows():
-    if row['Anomaly'] == 1 :
-      print(row['bytes'], row['timestamp'], row['Anomaly'])
-      anomaly =  { 
-        "timestamp": row['timestamp'], 
-        "expected" : row['bytes']
-      }
-      print(anomaly)
-      anomalies.append(anomaly)
+  predicted_anomalies=predictions[predictions['Anomaly']==1]
+
+  for index,row in predicted_anomalies.iterrows():
+    print(row['bytes'], row['timestamp'], row['Anomaly'])
+    anomaly =  { 
+      "timestamp": row['timestamp'], 
+      "expected" : row['bytes']
+    }
+    print(anomaly)
+    anomalies.append(anomaly)
 
   print("Anomalies: ")
   print(anomalies)
   return anomalies
 
-####### REST API ##########
-class DataRequest(BaseModel):
-  query: str
-  granularity: str
-  granularity_range: str
-  timeseries_range: int
-  frequency: str
-  query_end_time_text: str
-  detection_window: int
-  hours_of_lag: str
-  broker_host: str
-  broker_port: int
-
 app = FastAPI()
 
 @app.get("/")
 async def root():
-    return {"message": "Hello World"}
+  return "Welcome to Redborder Druid Anomaly Detector! Documentation: https://github.com/redBorder/rb-druid-anomaly-detection"
 
-@app.post("/process_query/")
-async def process_query(data_request: DataRequest) -> DataRequest:    
-    response = {}
+@app.post("/anomaly_detection/")
+#async def anomaly_detection(data_request: DataRequest) -> DataRequest:    
+async def anomaly_detection(request: Request):
+    data_request = await request.json() 
+  
+    status = True
+    error = ''
+    anomalies = []
+   
+    if not error:
+      try: 
+        training_data  = query_druid(data_request["broker_host"], data_request["broker_port"], data_request["data_sources"], data_request["granularity"], data_request["training_intervals"], build_aggregations(data_request["aggregations"]), build_filter(data_request["filters"]))
+        print("Training data: ")
+        print(training_data)
+        new_data       = query_druid(data_request["broker_host"], data_request["broker_port"], data_request["data_sources"], data_request["granularity"], data_request["intervals"], build_aggregations(data_request["aggregations"]), build_filter(data_request["filters"]))
+        print("New data: ")
+        print(new_data)
+      except:
+        error = 'Internal Error - Making druid queries'
+
+    if not error:
+      try:
+        predictions = build_predictions(training_data, new_data)      
+      except:
+        error = 'Internal Error - Making predictions'
+
+    if not error: 
+      try:
+        anomalies = process_anomalies(predictions)
+      except:
+        error = 'Internal Error - Processing anomalies'
     
-    druid_query = json.loads(data_request.query)
-    try:    
-      predictions = process_rb(data_request, druid_query)
-      anomalies = process_anomalies(predictions)
-    except:
-      response = {
-        "status" : "fail",
-        "error" : "Error processing query",
-        "anomalies" : []
-      }
-    else:
-      response = {
-        "status" : "success",
-        "error" : "false",
-        "anomalies" : anomalies
-      }
-    return json.loads(json.dumps(response))
+    if error:
+      anomalies = []
+      status = False
+    
+    return json.loads(json.dumps({ "status" : status, "error" : error, "anomalies" : anomalies }))
