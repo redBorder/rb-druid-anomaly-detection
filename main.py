@@ -57,21 +57,26 @@ def build_predictions(training_data, new_data):
    # init setup
   s=setup(training_data,normalize = True,silent=True)
   # train model
-  model = create_model('iforest') 
+  #model = create_model('iforest') 
+  model = create_model('knn') 
   # assign anomaly labels on training data
   model_results = assign_model(model)
   print(model_results)
   
   # prediction 
   predictions = predict_model(model, new_data)
+  print("predictions.head(): ")
+  print(predictions.head())
+
+  print("predictions: ")
   print(predictions)
 
   # save model pipeline
   save_model(model, 'model_pipeline')
   return predictions
 
-def process_anomalies(predictions):
-  """ Create anomalies json response with predicctions generated from the model.
+def build_anomalies(predictions, aggregation):
+  """ Create anomalies json response with predictions generated from the model.
     Args:
       predictions
 
@@ -85,10 +90,10 @@ def process_anomalies(predictions):
   predicted_anomalies=predictions[predictions['Anomaly']==1]
 
   for index,row in predicted_anomalies.iterrows():
-    print(row['bytes'], row['timestamp'], row['Anomaly'])
+    print(row[aggregation], row['timestamp'], row['Anomaly'])
     anomaly =  { 
       "timestamp": row['timestamp'], 
-      "expected" : row['bytes']
+      "expected" : row[aggregation]
     }
     print(anomaly)
     anomalies.append(anomaly)
@@ -131,7 +136,7 @@ async def anomaly_detection(request: Request):
 
     if not error: 
       try:
-        anomalies = process_anomalies(predictions)
+        anomalies = build_anomalies(predictions, data_request["aggregation"])
       except:
         error = 'Internal Error - Processing anomalies'
     
